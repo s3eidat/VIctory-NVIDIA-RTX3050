@@ -68,7 +68,7 @@ The diagnostics build (frame timelines, captures, GPU timing) is optional:
 
    ```toml
    [paths]
-   game_dir = 'D:\Games\MyDump'
+   game_dir = 'D:\path\to\your-game-folder'
    ```
 
 2. **DLSS (optional, recommended on RTX).** Download the Streamline SDK release from
@@ -93,7 +93,7 @@ The diagnostics build (frame timelines, captures, GPU timing) is optional:
 ## Run
 
 ```powershell
-.\scripts\play-foxhound.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+.\scripts\play-foxhound.ps1 -Exe 'D:\path\to\your-game-folder\game_scarlett_master.exe'
 ```
 
 | Option | What |

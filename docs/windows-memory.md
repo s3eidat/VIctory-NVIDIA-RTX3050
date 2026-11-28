@@ -35,7 +35,31 @@ initial test small. The following command uses the title's upscaler and a
 F1 preferences can override launcher options.
 
 ```powershell
-.\target\release\victory.exe play 'D:\Games\MyDump\game_scarlett_master.exe' --series-s --dlss off --no-framegen-ready --fps 30
+.\target\release\victory.exe play 'D:\path\to\your-game-folder\game_scarlett_master.exe' --series-s --dlss off --no-framegen-ready --fps 30
+```
+
+### `--low-memory`: 16 GB of RAM and an 8 GB card
+
+`victory play --low-memory` puts the settings for such a PC together:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Console | Series S | the title asks for less memory than on Series X |
+| Scene | 960x540, DLSS performance (1280x720 without NVIDIA's files) | smallest the title takes; 540 without DLSS stops it at the start |
+| Frame generation | off (asking for it with `--low-memory` is an error) | it takes 1.5 to 2 GB of the card |
+| `VICTORY_VRAM_BUDGET_MB` | 7168 | 7.0 GiB taken as the budget at most; the texture queue stops at nine tenths of it, the rest stays with Windows and the driver |
+| `VICTORY_PIPELINE_WORKERS` | 2 | each worker holds memory while it makes a pipeline; the reproduction below got past its crash with two, once a page file was on (two alone still reached the limit) |
+
+What the F1 menu saved and `--set` still go over these, and the startup log's
+`switches` line shows what was used. **None of this has been measured in play
+on a 16 GB PC with an 8 GB card.** A stable 30 frames a second there is
+unverified, and so is the picture: the reproduction below found a black 3D
+picture on an 8 GB card until `VICTORY_THIN=0` and `VICTORY_JOIN_PARTS=1`, which
+this profile does not set. A page file managed by Windows is still needed, since
+16 GB of RAM is below the commit the title reached on 32 GB.
+
+```powershell
+.\target\release\victory.exe play 'D:\path\to\your-game-folder\game_scarlett_master.exe' --low-memory
 ```
 
 ## Reproduction on 32 GB RAM and an 8 GB RTX 3060 Ti

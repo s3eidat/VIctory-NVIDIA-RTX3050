@@ -1343,7 +1343,7 @@ impl Due {
         let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
         again.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
-        fresh.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
+        Due::newest_and_oldest(&mut fresh, max.saturating_sub(again.len()));
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
         let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
         let (mut new, mut old) = (0, fresh.len());
@@ -1358,6 +1358,31 @@ impl Due {
         order.truncate(max);
         known.resize(order.len(), None);
         (order, known)
+    }
+
+    /// Puts what [`Due::ordered`] takes of `fresh` where a sort by write,
+    /// newest first, would put it: the `room.div_ceil(2)` newest at the
+    /// front and the `room / 2` oldest at the back, each end in order. The
+    /// middle, which is not taken, is left in no order. The queue holds some
+    /// 40,000 slots and a pass takes 4,096, so this selects rather than sorts.
+    fn newest_and_oldest(fresh: &mut [(u64, u32, u64)], room: usize) {
+        let key = |e: &(u64, u32, u64)| std::cmp::Reverse(e.2);
+        let n = fresh.len();
+        let (front, back) = (room.div_ceil(2), room / 2);
+        if front + back >= n {
+            fresh.sort_unstable_by_key(key);
+            return;
+        }
+        if front > 0 {
+            fresh.select_nth_unstable_by_key(front - 1, key);
+            fresh[..front].sort_unstable_by_key(key);
+        }
+        if back > 0 {
+            let rest = &mut fresh[front..];
+            let cut = rest.len() - back;
+            rest.select_nth_unstable_by_key(cut, key);
+            rest[cut..].sort_unstable_by_key(key);
+        }
     }
 }
 
@@ -6719,6 +6744,91 @@ mod tests {
         assert_eq!(known.iter().filter(|k| k.is_some()).count(), 1);
         let (order, known) = q.due_and_census(u64::MAX).0.ordered(1);
         assert_eq!((order.len(), known.len()), (1, 1));
+    }
+
+    /// Synthetic queues for [`Due::ordered`]: `fresh` slots with distinct
+    /// write numbers in a scrambled order, and `again` slots.
+    fn synthetic_due(seed: u64, fresh: usize, again: usize) -> Due {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut writes: Vec<u64> = (0..(fresh + again) as u64).map(|w| w * 3 + 1).collect();
+        for i in (1..writes.len()).rev() {
+            writes.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let (a, f) = writes.split_at(again);
+        Due {
+            again: a.iter().enumerate().map(|(i, &w)| (w / 2, i as u32, w, None)).collect(),
+            fresh: f.iter().enumerate().map(|(i, &w)| (w / 2, (again + i) as u32, w)).collect(),
+        }
+    }
+
+    /// [`Due::ordered`] as it was: the whole of `fresh` sorted.
+    fn ordered_by_full_sort(due: Due, max: usize) -> Vec<(u32, u64)> {
+        let Due { mut again, mut fresh } = due;
+        again.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
+        fresh.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
+        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old && order.len() < max {
+            order.push((fresh[new].1, fresh[new].2));
+            new += 1;
+            if new < old && order.len() < max {
+                old -= 1;
+                order.push((fresh[old].1, fresh[old].2));
+            }
+        }
+        order.truncate(max);
+        // (What `ordered` makes beside the order, so that timings compare the same work.)
+        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
+        known.resize(order.len(), None);
+        std::hint::black_box(known);
+        order
+    }
+
+    /// Selecting the two ends serves the same slots in the same order as
+    /// sorting the whole queue, at every size of pass, with and without
+    /// slots looked at before.
+    #[test]
+    fn selecting_the_ends_serves_as_a_full_sort_does() {
+        for (seed, fresh, again) in [(1u64, 0usize, 0usize), (2, 1, 0), (3, 2, 1), (4, 7, 0), (5, 64, 5), (6, 501, 0), (7, 1000, 40)] {
+            for max in [1, 2, 3, 4, 5, 8, 33, 40, 41, 42, 100, 499, 500, 501, 502, 1040, 5000] {
+                let got = synthetic_due(seed, fresh, again).ordered(max);
+                let want = ordered_by_full_sort(synthetic_due(seed, fresh, again), max);
+                assert_eq!(got.0, want, "fresh {fresh}, again {again}, max {max}");
+                assert_eq!(got.1.len(), got.0.len());
+            }
+        }
+    }
+
+    /// What selecting saves over sorting, on a queue the size the comments
+    /// name (40,000 slots, a pass of 4,096). Synthetic data; run with
+    /// `cargo test -p victory-gpu --release -- --ignored --nocapture due_order_costs`.
+    #[test]
+    #[ignore]
+    fn due_order_costs() {
+        for (fresh, max) in [(10_000usize, 4096usize), (40_000, 4096), (40_000, 1 << 16)] {
+            let time = |f: &dyn Fn() -> usize| {
+                let mut best = f64::MAX;
+                for _ in 0..20 {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(f());
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                best * 1e3
+            };
+            let full = time(&|| ordered_by_full_sort(synthetic_due(9, fresh, 0), max).len());
+            let select = time(&|| synthetic_due(9, fresh, 0).ordered(max).0.len());
+            let build = time(&|| synthetic_due(9, fresh, 0).fresh.len());
+            println!(
+                "{fresh:>6} slots, pass of {max:>5}: full sort {:.3} ms, select {:.3} ms (each includes {:.3} ms making the queue)",
+                full, select, build
+            );
+        }
     }
 
     /// What the pass tells of several slots under one take of the lock ends

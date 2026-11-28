@@ -112,7 +112,7 @@ with "Desktop development with C++", then in PowerShell:
 git clone https://github.com/trustno1-coder/VIctory-NVIDIA
 cd VIctory-NVIDIA
 .\Get-NVIDIA-DLSS.cmd
-powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\path\to\your-game-folder\game_scarlett_master.exe'
 ```
 
 Put the path to **your** `game_scarlett_master.exe` in the last line. The
@@ -276,6 +276,10 @@ rooms.
 
 foxhound's own measurements, on an RTX 4070 SUPER, are in its README.
 
+These figures are from the machines named. A stable 30 frames a second on
+other hardware is unverified until you measure it there. Building from source,
+the full requirements and the test commands: [docs/building.md](docs/building.md).
+
 What is known to be wrong:
 
 - **No ray tracing.** The title's own is off (`VICTORY_BVH_BUILDER=1`, or the
@@ -311,7 +315,7 @@ git clone https://github.com/trustno1-coder/VIctory-NVIDIA
 cd VIctory-NVIDIA
 copy victory.example.toml victory.toml      # then set game_dir to your dump's folder, outside this one
 .\Get-NVIDIA-DLSS.cmd                        # once: NVIDIA's DLSS and frame generation files, about 70 MB
-scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+scripts\play-nvidia.ps1 -Exe 'D:\path\to\your-game-folder\game_scarlett_master.exe'
 ```
 
 The first start builds the layer (a few minutes). `Get-NVIDIA-DLSS.cmd` gets

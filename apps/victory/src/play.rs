@@ -147,6 +147,16 @@ const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performanc
 /// start, 0xc0000094, a division by zero in the title, 2026-11-28).
 const S_SIZES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
 
+/// `--low-memory`'s most of the card's memory taken as the budget, in MB
+/// (`VICTORY_VRAM_BUDGET_MB`): 7.0 GiB of an 8 GB card, the rest left to
+/// Windows and the driver. The texture queue stops at nine tenths of it.
+const LOW_MEMORY_VRAM_MB: u32 = 7168;
+/// `--low-memory`'s pipeline workers (`VICTORY_PIPELINE_WORKERS`): each holds
+/// memory while it makes a pipeline. A 32 GB PC got past its crash with two
+/// once a page file was on (docs/windows-memory.md); fewer workers make a
+/// cold cache slower to fill.
+const LOW_MEMORY_PIPELINE_WORKERS: u32 = 2;
+
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
     /// The title's executable. Without it: `game_scarlett_master.exe` beside
@@ -160,8 +170,17 @@ pub(crate) struct Play {
     #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
     res: String,
     /// DLSS in place of the title's upscaling (needs NVIDIA's files).
-    #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
+    /// With `--low-memory`: performance unless given.
+    #[arg(long, default_value = "quality", default_value_if("low_memory", "true", Some("performance")), value_parser = DLSS_MODES)]
     dlss: String,
+    /// A start for a PC with 16 GB of RAM and a card with 8 GB: the Series S
+    /// profile at its smallest scene (960x540 with DLSS performance; 1280x720
+    /// without NVIDIA's files), no frame generation, no more than
+    /// [`LOW_MEMORY_VRAM_MB`] of the card taken as the budget, and
+    /// [`LOW_MEMORY_PIPELINE_WORKERS`] pipeline workers (each holds memory
+    /// while it makes one). What the F1 menu saved and `--set` still go over it.
+    #[arg(long, conflicts_with_all = ["framegen", "framegen_ready"])]
+    low_memory: bool,
     /// DLSS frame generation on from the start: frames shown for each one
     /// rendered, 2 to 6. Without it, it is off (see `--framegen-ready`).
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
@@ -289,7 +308,7 @@ fn parse_menu(text: &str) -> Vec<(String, String)> {
 /// `streamline`: the folder with NVIDIA's files, if there is one.
 fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (BTreeMap<String, String>, bool) {
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-    let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
+    let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s || o.low_memory, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
     let mut dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
     // Series S picture: the scene's size, which with DLSS on is its mode (the menu keeps the
@@ -370,6 +389,10 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     }
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
+    if o.low_memory {
+        set("VICTORY_VRAM_BUDGET_MB", &LOW_MEMORY_VRAM_MB.to_string());
+        set("VICTORY_PIPELINE_WORKERS", &LOW_MEMORY_PIPELINE_WORKERS.to_string());
+    }
     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
         if v.is_empty() {
             s.remove(k);
@@ -952,6 +975,9 @@ fn restart_args(o: &Play, exe: &Path) -> String {
     if o.series_s {
         args.push("--series-s".to_owned());
     }
+    if o.low_memory {
+        args.push("--low-memory".to_owned());
+    }
     args.extend(["--res".to_owned(), quoted(&o.res), "--dlss".to_owned(), quoted(&o.dlss)]);
     if let Some(x) = o.framegen {
         args.extend(["--framegen".to_owned(), x.to_string()]);
@@ -993,7 +1019,54 @@ mod tests {
             fps: 1000,
             more: Vec::new(),
             preload: false,
+            low_memory: false,
         }
+    }
+
+    /// The command line as `victory play` reads it.
+    fn parsed(args: &[&str]) -> Result<Play, clap::Error> {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Line {
+            #[command(flatten)]
+            play: Play,
+        }
+        Line::try_parse_from(std::iter::once("x").chain(args.iter().copied())).map(|l| l.play)
+    }
+
+    /// `--low-memory`: Series S at its smallest scene with DLSS, its own
+    /// default only where nothing else was asked, the card's budget and the
+    /// pipeline workers held down, and no frame generation.
+    #[test]
+    fn low_memory_is_series_s_at_its_smallest_within_hard_budgets() {
+        let o = parsed(&["--low-memory"]).unwrap();
+        assert_eq!(o.dlss, "performance");
+        let (s, series_s) = settings(&o, &[], Some(Path::new("x")));
+        assert!(series_s);
+        assert_eq!(s["VICTORY_MENU_S_RES"], "540");
+        assert_eq!(s["VICTORY_DLSS_MODE"], "performance");
+        assert_eq!(s["VICTORY_VRAM_BUDGET_MB"], "7168");
+        assert_eq!(s["VICTORY_PIPELINE_WORKERS"], "2");
+        assert!(!s.contains_key("VICTORY_FRAMEGEN"));
+        assert!(!s.contains_key("VICTORY_NATIVE_1440P"));
+        // Without NVIDIA's files: the game's own 1280x720 (its FidelityFX from 540 stops it).
+        let (s, _) = settings(&o, &[], None);
+        assert_eq!(s["VICTORY_MENU_S_RES"], "720");
+        assert!(!s.contains_key("VICTORY_DLSS"));
+        assert_eq!(s["VICTORY_VRAM_BUDGET_MB"], "7168");
+        // Asked for: kept. `--set` goes over the profile.
+        let o = parsed(&["--low-memory", "--dlss", "balanced", "--set", "VICTORY_VRAM_BUDGET_MB=6144"]).unwrap();
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        assert_eq!((s["VICTORY_MENU_S_RES"].as_str(), s["VICTORY_VRAM_BUDGET_MB"].as_str()), ("626", "6144"));
+        // Frame generation cannot be asked with it; a restart keeps it.
+        assert!(parsed(&["--low-memory", "--framegen", "2"]).is_err());
+        assert!(parsed(&["--low-memory", "--framegen-ready"]).is_err());
+        let o = parsed(&["--low-memory"]).unwrap();
+        let again = restart_args(&o, Path::new(r"C:\path\to\title.exe"));
+        assert!(again.contains(" --low-memory ") && again.contains("--dlss 'performance'"), "{again}");
+        // Without it nothing of this is set.
+        let (s, series_s) = settings(&parsed(&[]).unwrap(), &[], Some(Path::new("x")));
+        assert!(!series_s && !s.contains_key("VICTORY_VRAM_BUDGET_MB") && !s.contains_key("VICTORY_PIPELINE_WORKERS"));
     }
 
     #[test]
@@ -1004,7 +1077,7 @@ mod tests {
             #[command(flatten)]
             play: Play,
         }
-        let exe = Path::new(r"C:\Games\GTA VI's\game_scarlett_master.exe");
+        let exe = Path::new(r"C:\path\to\your game's folder\game_scarlett_master.exe");
         let first = [
             "x", "--series-s", "--dlss", "performance", "--framegen", "2", "--fg-type", "dlss", "--set", "VICTORY_MFG_UNLOCKER=1", "--set",
             "VICTORY_X=a b", "--preload",
@@ -1013,7 +1086,7 @@ mod tests {
         let args = restart_args(&o, exe);
         assert_eq!(
             args,
-            r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b'"
+            r"play 'C:\path\to\your game''s folder\game_scarlett_master.exe' --series-s --res '1440' --dlss 'performance' --framegen 2 --fg-type 'dlss' --fps 1000 --set 'VICTORY_MFG_UNLOCKER=1' --set 'VICTORY_X=a b'"
         );
         // Read back as PowerShell reads it: the same options again, and no preload.
         let mut words: Vec<String> = Vec::new();
@@ -1037,7 +1110,7 @@ mod tests {
         let plain = Line::try_parse_from(["x"]).unwrap().play;
         assert_eq!(
             restart_args(&plain, exe),
-            r"play 'C:\Games\GTA VI''s\game_scarlett_master.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
+            r"play 'C:\path\to\your game''s folder\game_scarlett_master.exe' --res '1440' --dlss 'quality' --fg-type 'auto' --fps 1000"
         );
     }
 

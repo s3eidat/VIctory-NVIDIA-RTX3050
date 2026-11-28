@@ -84,3 +84,10 @@ Thumbs.db
 # What the F1 menu saved
 /victory-settings.txt
 /victory-settings.*.txt
+# Local path to the user's own game files
+/game_dir.txt
+# Run output: logs, crash reports and frame captures stay local
+/*.log
+/crashes.log
+/cap/
+/captures/

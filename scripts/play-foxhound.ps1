@@ -1,7 +1,7 @@
 # Starts your own copy of the title on foxhound with the settings tested on an RTX 4070 SUPER (Series X profile,
 # 2560x1440 output, DLSS Quality when NVIDIA Streamline is set up).
 #
-#   .\scripts\play-foxhound.ps1 -Exe 'D:\MyDump\game_scarlett_master.exe'
+#   .\scripts\play-foxhound.ps1 -Exe 'D:\path\to\your-game-folder\game_scarlett_master.exe'
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss off            the title's own upscaling, no DLSS
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)

@@ -191,28 +191,55 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    mirror_slots(handle, 1, 1);
+}
+
+/// [`mirror`] for `count` slots `step` bytes apart from `first`, as a copy
+/// of descriptors writes them: the heaps are looked up once for each run of
+/// slots in one heap, not once a slot, and a heap whose host heap is made
+/// is not locked at all. Copies come 60,000-210,000 times a frame on the
+/// title's recording threads.
+#[cfg(windows)]
+fn mirror_slots(first: u64, count: u64, step: u64) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, _, at)) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
-    else {
-        return;
-    };
-    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
-    // the `SHADER_HEAPS` lock we hold here.
-    let heap = unsafe { &*(at as *const Heap) };
-    let Some(index) = heap.index(handle) else {
-        return;
-    };
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-    match heap.host.get() {
-        None => pending.push(index),
-        Some(host) => {
-            drop(pending);
-            if let Some(host) = host {
+    let mut i = 0;
+    while i < count {
+        let at_slot = first + i * step;
+        let Some(&(_, end, at)) = heaps
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&at_slot))
+        else {
+            i += 1;
+            continue;
+        };
+        // The slots of the run that start inside this heap.
+        let n = (end - at_slot).div_ceil(step).min(count - i);
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(at as *const Heap) };
+        let slots = (0..n).map(|k| at_slot + k * step).filter_map(|h| Some((heap.index(h)?, h)));
+        // Once made, the host heap stays: no lock is needed to use it. Until
+        // then `Heap::host` makes it under `pending`, so look again under it.
+        let host = match heap.host.get() {
+            Some(host) => host,
+            None => {
+                let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+                match heap.host.get() {
+                    None => {
+                        pending.extend(slots.map(|(index, _)| index));
+                        i += n;
+                        continue;
+                    }
+                    Some(host) => host,
+                }
+            }
+        };
+        if let Some(host) = host {
+            for (index, handle) in slots {
                 host.mirror(index, handle, false);
             }
         }
+        i += n;
     }
 }
 
@@ -1231,7 +1258,7 @@ fn shape_census(shape: &Shape, count: usize) {
             set.insert(w);
         }
     }
-    if count == 1000 || (count > 0 && count % 50_000 == 0) {
+    if count == 1000 || (count > 0 && count.is_multiple_of(50_000)) {
         let distinct: Vec<String> = seen.iter().map(|s| s.len().to_string()).collect();
         let last: Vec<String> = words.iter().map(|w| format!("{w:x}")).collect();
         tracing::info!(
@@ -1901,9 +1928,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_slots(dst, u64::from(count), step);
     }
 }
 
@@ -2081,6 +2106,74 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A shader-visible view heap of `count` slots whose host heap is not
+    /// made yet, so what is mirrored into it waits in `pending`.
+    #[cfg(windows)]
+    fn waiting_heap(count: u32) -> &'static Heap {
+        let desc = HeapDesc { kind: 0, count, flags: 1, nodes: 0 };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        heap(h)
+    }
+
+    #[cfg(windows)]
+    fn pending(heap: &Heap) -> Vec<u32> {
+        std::mem::take(&mut *heap.pending.lock().unwrap())
+    }
+
+    /// A copy of descriptors notes each slot it wrote once and in order, as
+    /// when every slot was looked up on its own; a run that goes past the
+    /// heap's end notes only the slots inside it.
+    #[cfg(windows)]
+    #[test]
+    fn copied_slots_are_mirrored_once_each() {
+        let null = std::ptr::null();
+        let h = waiting_heap(16);
+        let source = [0u64; 4 * 5];
+        copy_simple(null, 5, h.start + 2 * 32, source.as_ptr() as u64, 0);
+        assert_eq!(pending(h), [2, 3, 4, 5, 6]);
+        // Past the end (no bytes written: only the mirroring is asked). What
+        // lies beyond may be another test's heap; mirroring its slots again
+        // from their own bytes changes nothing there.
+        mirror_slots(h.start + 14 * 32, 6, 32);
+        assert_eq!(pending(h), [14, 15]);
+        mirror(h.start + 9 * 32 + 5);
+        assert_eq!(pending(h), [9]);
+    }
+
+    /// What looking the heaps up once a run saves over once a slot, on a
+    /// synthetic heap (no title, no card). Run with `cargo test -p
+    /// victory-gpu --release -- --ignored --nocapture mirror_costs`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn mirror_costs() {
+        let h = waiting_heap(1 << 16);
+        for slots in [1u64, 8, 64, 256] {
+            let copies = (1 << 20) / slots;
+            let time = |f: &dyn Fn(u64)| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    pending(h);
+                    let t = std::time::Instant::now();
+                    for c in 0..copies {
+                        f(h.start + (c * slots % (1 << 15)) * 32);
+                    }
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                best * 1e9 / (copies * slots) as f64
+            };
+            let each = time(&|at| {
+                for i in 0..slots {
+                    mirror(at + i * 32);
+                }
+            });
+            let run = time(&|at| mirror_slots(at, slots, 32));
+            println!("copies of {slots:>3} slots: looked up slot by slot (as before) {each:.1} ns/slot, once a run {run:.1} ns/slot");
+        }
+        pending(h);
     }
 
     #[cfg(windows)]
