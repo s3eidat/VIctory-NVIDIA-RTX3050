@@ -86,8 +86,10 @@ Thumbs.db
 /victory-settings.*.txt
 # Local path to the user's own game files
 /game_dir.txt
-# Run output: logs, crash reports and frame captures stay local
+# Local run output
 /*.log
 /crashes.log
 /cap/
 /captures/
+/cache/
+/user-run*.log
